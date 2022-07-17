@@ -1,0 +1,501 @@
+# aws cloudformation create-stack --stack-name aws-glue-cicd --template-body file://aws-glue-cicd.yaml --capabilities CAPABILITY_NAMED_IAM
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  GlueRepoName:
+    Type: String
+    Default: glue-source
+  InfraRepoName:
+    Type: String
+    Default: glue-cicd
+  TestStackName:
+    Type: String
+    Default: glue-test
+Resources:
+  ##################################################
+  ##### CodeBuild | CodePipeline | CodeCommit. #####
+  ##################################################
+
+  ### AWS CodeCommit repo for Glue jobs; test; and infrastructure yaml files. ###
+  GlueRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryDescription: repo for demo Glue source files. Script; Test; and Test infrastructures.
+      RepositoryName: !Ref 'GlueRepoName'
+
+  ### AWS CodeCommit repo for CICD infrastructure yaml and helper files. ###
+  CICDRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryDescription: repo for Glue CICD infrastructure and helper files.
+      RepositoryName: !Ref 'InfraRepoName'
+  
+  ### AWS S3 bucket for Codebuild project runs artifacts. ###
+  CodePipelineBucket:
+    Type: AWS::S3::Bucket
+
+  ### AWS S3 bucket for Glue Scripts. ###
+  GlueScriptBucket:
+    Type: AWS::S3::Bucket
+    # Need Versioning enabled
+
+  ### CodeBuild project find test infrastructure yaml file and test python file. ###
+  automatedTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        Type: LINUX_CONTAINER
+      Name: !Sub '${AWS::StackName}FN'
+      ServiceRole: !GetAtt 'CodeBuildServiceRole.Arn'
+      TimeoutInMinutes: 30
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                  python: 3.9
+            build:
+              commands:
+                - echo Configuring AWS credentials
+                - echo AWS_CONTAINER_CREDENTIALS_RELATIVE_URI $AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+                - curl -qL -o aws_credentials.json http://169.254.170.2/$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI > aws_credentials.json
+                - aws configure set aws_access_key_id `jq -r '.AccessKeyId' aws_credentials.json`
+                - aws configure set aws_secret_access_key `jq -r '.SecretAccessKey' aws_credentials.json`
+                - aws configure set aws_session_token `jq -r '.Token' aws_credentials.json`
+                - aws configure set default.region $AWS_REGION
+                - files=(git diff-tree --no-commit-id --name-only -r $CODEBUILD_RESOLVED_SOURCE_VERSION)
+                - pip install boto3 && python ..\$CODEBUILD_SRC_DIR_cicdsource\handleCommit.py $CODEBUILD_RESOLVED_SOURCE_VERSION $files
+          artifacts:
+            files:
+              - '*'
+              - '**/*'
+              
+  ### CodeBuild project run datalakelive_tst.py in AWS Linux 2 env. ###
+  automatedTestClean:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        Type: LINUX_CONTAINER
+      Name: !Sub '${AWS::StackName}FN'
+      ServiceRole: !GetAtt 'CodeBuildServiceRole.Arn'
+      TimeoutInMinutes: 30
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                  python: 3.9
+            build:
+              commands:
+                - echo Configuring AWS credentials
+                - echo AWS_CONTAINER_CREDENTIALS_RELATIVE_URI $AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+                - curl -qL -o aws_credentials.json http://169.254.170.2/$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI > aws_credentials.json
+                - aws configure set aws_access_key_id `jq -r '.AccessKeyId' aws_credentials.json`
+                - aws configure set aws_secret_access_key `jq -r '.SecretAccessKey' aws_credentials.json`
+                - aws configure set aws_session_token `jq -r '.Token' aws_credentials.json`
+                - aws configure set default.region $AWS_REGION
+                - files=(git diff-tree --no-commit-id --name-only -r $CODEBUILD_RESOLVED_SOURCE_VERSION)
+                - pip install boto3 && python ..\$CODEBUILD_SRC_DIR_cicdsource\handleTestCleanUp.py $CODEBUILD_RESOLVED_SOURCE_VERSION $files
+                - aws s3 sync . s3://${GlueScriptBucket}
+          artifacts:
+            files:
+              - '*'
+              - '**/*' 
+  
+  ### CodePipeline automated workflow for test and deploy Glue jobs. ###
+  pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: !Ref 'CodePipelineBucket'
+      RoleArn: !GetAtt 'CodePipelineServiceRole.Arn'
+      Stages:
+      - Name: Source # Triggered by new commit to branch master of CodeCommit repository above.
+        Actions:
+        - Name: Appsource
+          ActionTypeId:
+            Category: Source
+            Owner: AWS
+            Provider: CodeCommit
+            Version: '1'
+          RunOrder: 1
+          Configuration:
+            BranchName: main
+            OutputArtifactFormat: CODEBUILD_CLONE_REF # full clone in order to access git metadata
+            PollForSourceChanges: 'true' # https://docs.aws.amazon.com/codepipeline/latest/userguide/pipelines-trigger-source-repo-changes-cfn.html change to CloudWatch event for meeting new standards.
+            RepositoryName: !Ref 'GlueRepoName'
+          OutputArtifacts:
+          - Name: appsource
+        - Name: CICDsource
+          ActionTypeId:
+            Category: Source
+            Owner: AWS
+            Provider: CodeCommit
+            Version: '1'            
+          RunOrder: 1          
+          Configuration:
+            BranchName: main
+            PollForSourceChanges: 'false'
+            RepositoryName: !Ref 'InfraRepoName'
+          OutputArtifacts:
+          - Name: cicdsource          
+      - Name: Test # Large stage which included 3 subprocesses for testing Glue code.
+        Actions:
+        - Name: AutomatedTest # Subprocess of "Test". Deploy nescessary infrastructure for testing Glue jobs, from template "gluedatalake.yaml" to CFN stack.
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Version: '1'
+            Provider: CodeBuild
+          InputArtifacts:
+          - Name: appsource
+          - Name: cicdsource
+          Configuration:
+            ProjectName: !Ref 'automatedTest'
+            PrimarySource: appsource
+          RunOrder: 1
+        - Name: TestApproval # Subprocess of "Test". Wait for authorized user to approve tests results.
+          ActionTypeId:
+            Category: Approval
+            Owner: AWS
+            Version: '1'
+            Provider: Manual
+          RunOrder: 2         
+        - Name: AutomatedTestClean # Subprocess of "Test". Delete "deploy" CFN stack in "AutomatedTest" after manual approval has been obtained.
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Version: '1'
+            Provider: CodeBuild
+          InputArtifacts:
+          - Name: appsource
+          - Name: cicdsource
+          Configuration:
+            ProjectName: !Ref 'automatedTestClean'
+            PrimarySource: appsource
+          RunOrder: 3  
+  
+  ###################################################################################################################
+  ##### CFN custom housekeeping events for stack creation and delete. With lambda functions to trigger/log them. #####
+  ###################################################################################################################
+
+  ### Lambda function handle user delete this stack event - help CFN delete all S3 bucket's objects, before CFN delete the bucket itself.###
+  DeleteBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt 's3LambdaCopyRole.Arn'
+      Runtime: "python3.9"
+      Timeout: 900
+      Handler: "index.handler"
+      Code: 
+        ZipFile: |
+         import cfnresponse
+         import boto3
+         from botocore.client import Config
+         import zipfile
+         def handler(event, context):
+            client = boto3.client('s3')
+            destinationbucket = event['ResourceProperties']['bucketName']
+            if event['RequestType'] == 'Delete':
+               s3 = boto3.resource('s3')
+               bucket = s3.Bucket(destinationbucket)
+               for key in bucket.objects.all():
+                  client.delete_object(Bucket=destinationbucket,  Key=key.key)
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "CustomResourcePhysicalID")
+  
+      # CFN custom event - couples "CodePipelineBucket" items with "DeleteBucketFunction".
+  DeleteBucket:
+    Type: Custom::DeleteBucket
+    DependsOn: CodePipelineBucket
+    Properties:
+      ServiceToken: !GetAtt DeleteBucketFunction.Arn
+      bucketName: !Ref 'CodePipelineBucket'
+  
+  ##########################################
+  ##### IAM User; Policies; and Roles. #####
+  ##########################################
+
+  CloudFormationPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy for cloudformation to create resources
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Action:
+          - iam:CreateRole
+          - iam:CreatePolicy
+          - iam:GetRole
+          - iam:DeleteRole
+          - iam:PutRolePolicy
+          - iam:DeleteRolePolicy
+          - iam:AttachRolePolicy
+          - iam:DetachRolePolicy
+          - lambda:CreateFunction
+          - lambda:DeleteFunction
+          - lambda:InvokeFunction
+          - lambda:UpdateFunctionCode 
+          - lambda:UpdateFunctionConfiguration
+          - lambda:GetFunction
+          - lambda:GetFunctionConfiguration
+          Resource: '*'
+          Effect: Allow
+        - Effect: Allow
+          Action:
+          - iam:PassRole
+          Resource: 
+          - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${TestStackName}-*'
+          - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${productionStackName}-*'
+  S3Policy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy for creating working with s3 buckets
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          - s3:DeleteObject
+          - s3:DeleteObjectVersion
+          Resource: 
+          - !Sub 'arn:aws:s3:::${CodePipelineBucket}/*'
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          - s3:GetObject
+          Resource: 
+          - arn:aws:s3:::280887266599-bobono-cf/*
+          - arn:aws:s3:::280887266599-bobono-cf
+          - !Sub 'arn:aws:s3:::${CodePipelineBucket}/*'
+          - !Sub 'arn:aws:s3:::${CodePipelineBucket}'
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          - s3:GetObject
+          - s3:PutObject
+          - s3:DeleteObject
+          - s3:DeleteObjectVersion
+          - s3:CreateBucket
+          - s3:DeleteBucket
+          - s3:Delete*
+          - s3:GetBucketLocation
+          - s3:ListBucket
+          - s3:ListBucketMultipartUploads
+          - s3:ListMultipartUploadParts
+          - s3:AbortMultipartUpload
+          Resource: 
+          - !Sub 'arn:aws:s3:::${TestStackName}*'
+          - !Sub 'arn:aws:s3:::${productionStackName}*'
+        - Effect: Allow
+          Action:
+          - CloudFormation:DeleteStack
+          - CloudFormation:DescribeStacks 
+          Resource: 
+          - !Sub 'arn:aws:cloudformation:*:*:stack/${TestStackName}*'
+          - !Sub 'arn:aws:cloudformation:*:*:stack/${productionStackName}*'
+  testJobPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy for testing job run
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action:
+          - glue:CreateDatabase
+          - glue:DeleteDatabase
+          - glue:GetCrawler
+          - glue:GetCrawlers
+          - glue:GetDatabase
+          - glue:GetDatabases
+          - glue:StartCrawler
+          - glue:StartJobRun
+          - glue:GetJobRun
+          - glue:GetTable
+          - glue:GetTables
+          - glue:GetPartition
+          - glue:GetPartitions
+          - glue:BatchGetPartition
+          - athena:StartQueryExecution
+          Resource: 
+          - '*'
+  gituserpolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy for git user
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Action:
+          - codecommit:BatchGetRepositories
+          - codecommit:Get*
+          - codecommit:List*
+          - codecommit:CreateBranch
+          - codecommit:Put*
+          - codecommit:Test*
+          - codecommit:Update*
+          - codecommit:GitPull
+          - codecommit:GitPush
+          Resource: '*'
+          Effect: Allow 
+  codePipelinePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy for code pipeline
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action:
+          - codecommit:CancelUploadArchive
+          - codecommit:GetBranch
+          - codecommit:GetCommit
+          - codecommit:GetUploadArchiveStatus
+          - codecommit:UploadArchive
+          - codecommit:PutFile
+          - lambda:InvokeFunction
+          - lambda:ListFunctions
+          - cloudformation:CreateStack
+          - cloudformation:DescribeStacks
+          - cloudformation:UpdateStack
+          - cloudformation:CreateChangeSet
+          - cloudformation:DeleteChangeSet
+          - cloudformation:DescribeChangeSet
+          - cloudformation:ExecuteChangeSet
+          - cloudformation:SetStackPolicy
+          - cloudformation:ValidateTemplate
+          - cloudformation:DescribeStackResources
+          - codepipeline:PutJobFailureResult
+          - codepipeline:PutJobSuccessResult
+          - codecommit:BatchGetRepositories
+          - codecommit:Get*
+          - codecommit:List*
+          - codecommit:CreateBranch
+          - codecommit:Put*
+          - codecommit:Test*
+          - codecommit:Update*
+          - codecommit:GitPull
+          - codecommit:GitPush    
+          - iam:GetRole        
+          - iam:ListRoles
+          - iam:GetPolicy
+          - iam:GetInstanceProfile
+          - iam:GetPolicyVersion
+          Resource: 
+          - '*'
+        - Effect: Allow
+          Action:
+          - iam:PassRole
+          Resource: 
+          - !GetAtt 'CloudFormationRole.Arn'
+        - Action:
+          - iam:CreateServiceSpecificCredential
+          - iam:ListServiceSpecificCredentials
+          - iam:UpdateServiceSpecificCredential
+          - iam:DeleteServiceSpecificCredential
+          - iam:ResetServiceSpecificCredential
+          Resource: !GetAtt 'GitUser.Arn'
+          Effect: Allow 
+  
+  s3LambdaCopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - !Ref S3Policy
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - !Ref S3Policy
+      - arn:aws:iam::aws:policy/AWSCloudFormationReadOnlyAccess
+      - !Ref testJobPolicy
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - !Ref gituserpolicy
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codepipeline.amazonaws.com
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - !Ref S3Policy
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - !Ref codePipelinePolicy
+      - arn:aws:iam::aws:policy/AWSCodeBuildDeveloperAccess
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - cloudformation.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - !Ref S3Policy
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - !Ref CloudFormationPolicy
+      - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  # IAM user - failed to delete with stack.
+  GitUser:
+    Type: "AWS::IAM::User"
+    Properties: 
+            ManagedPolicyArns:
+            - !Ref gituserpolicy
+
+Outputs:
+  PipelineName:
+    Value: !Ref 'pipeline'

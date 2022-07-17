@@ -1,0 +1,12 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  GlueRepoName:
+    Type: String
+    Default: glue-source
+  InfraRepoName:
+    Type: String
+    Default: glue-cicd
+  liveTestStackName:
+    Type: String
+    Default: glue-test
+Resources:
